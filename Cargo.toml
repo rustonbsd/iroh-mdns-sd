@@ -1,0 +1,13 @@
+[package]
+name = "iroh-mdns-sd"
+version = "0.0.1"
+edition = "2024"
+description = "mdns-sd crate wrapped for iroh address lookup"
+license = "MIT"
+authors = ["Zacharias Boehler <rustonbsd@mailfence.com>"]
+repository = "https://github.com/rustonbsd/iroh-mdns-sd"
+readme = "README.md"
+keywords = ["networking"]
+categories = ["network-programming"]
+
+[dependencies]
