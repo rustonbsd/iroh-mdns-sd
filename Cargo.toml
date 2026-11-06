@@ -7,7 +7,19 @@ license = "MIT"
 authors = ["Zacharias Boehler <rustonbsd@mailfence.com>"]
 repository = "https://github.com/rustonbsd/iroh-mdns-sd"
 readme = "README.md"
-keywords = ["networking"]
+keywords = ["networking","iroh", "mdns", "address-lookup"]
 categories = ["network-programming"]
 
 [dependencies]
+iroh = { version = "1", default-features = false }
+iroh-base = { version = "1", default-features = false, features = ["key"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+data-encoding = "2"
+
+n0-watcher = "1"
+n0-future = "0.3"
+futures-util = "0.3"
+
+mdns-sd = { version = "0.21" }
