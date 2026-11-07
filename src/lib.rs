@@ -1,18 +1,18 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    net::{IpAddr, SocketAddr},
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
     str::FromStr,
     sync::Arc,
-    time::Instant,
+    time::Duration,
 };
 
 use iroh::{
-    Endpoint, EndpointId, PublicKey, Watcher,
+    Endpoint, EndpointId, PublicKey, RelayUrl, Watcher,
     address_lookup::{
         AddressLookup, AddressLookupBuilder, AddressLookupBuilderError,
         Error as AddressLookupError, Item as AddressLookupItem,
     },
-    endpoint_info::{AddrFilter, EndpointData, EndpointInfo, UserData},
+    endpoint_info::{AddrFilter, EndpointData, EndpointInfo},
 };
 use n0_future::{
     Stream,
@@ -27,24 +27,13 @@ use tokio::{
 };
 use tracing::{Instrument, debug, error, info_span, trace, warn};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+
+const DEFAULT_RESOLVE_DURATION: Duration = Duration::from_secs(10);
 
 const NAME: &str = "mdns-sd";
 const SERVICE_TYPE: &str = "_irohsd._udp.local.";
 const USER_DATA_KEY: &str = "user-data";
-
-pub(crate) type TxtData = BTreeMap<String, Option<String>>;
-
-/// A peer discovered by the swarm discovery service.
-///
-/// The discovery yields service instances, which are located by a port and a list of IP addresses.
-/// Both IPv4 and IPv6 addresses may be present, depending on the configuration.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Peer {
-    addrs: Vec<(IpAddr, u16)>,
-    last_seen: Instant,
-    txt: TxtData,
-}
 
 /// Address Lookup using the `mdns-sd` crate.
 #[derive(Debug, Clone)]
@@ -110,6 +99,7 @@ pub struct MdnsAddressLookupBuilder {
     advertise: bool,
     service_type: String,
     filter: AddrFilter,
+    resolve_duration: Duration,
 }
 
 impl MdnsAddressLookupBuilder {
@@ -119,6 +109,7 @@ impl MdnsAddressLookupBuilder {
             advertise: true,
             service_type: SERVICE_TYPE.to_string(),
             filter: AddrFilter::default(),
+            resolve_duration: DEFAULT_RESOLVE_DURATION,
         }
     }
 
@@ -149,12 +140,32 @@ impl MdnsAddressLookupBuilder {
         self
     }
 
+    /// Sets the resolve duration.
+    ///
+    /// This sets the duration we wait after a resolve request for discovery information about the
+    /// requested peer to come in and to refresh.
+    ///
+    /// If address information is already known at resolve time it is forwarded instantly
+    /// and any further updates that come in during the active `resolve_duration` is additionally
+    /// forwarded to the subscribers and `iroh`s [`AddressLookupItem`] [`BoxStream<Result<AddressLookupItem>>`]
+    pub fn resolve_duration(mut self, resolve_duration: Duration) -> Self {
+        assert!(!resolve_duration.is_zero());
+        self.resolve_duration = resolve_duration;
+        self
+    }
+
     /// Builds an [`MdnsAddressLookup`] instance with the configured settings.
     pub fn build(
         self,
         endpoint_id: EndpointId,
     ) -> Result<MdnsAddressLookup, AddressLookupBuilderError> {
-        MdnsAddressLookup::new(endpoint_id, self.advertise, self.service_type, self.filter)
+        MdnsAddressLookup::new(
+            endpoint_id,
+            self.advertise,
+            self.service_type,
+            self.filter,
+            self.resolve_duration,
+        )
     }
 }
 
@@ -236,9 +247,6 @@ impl MdnsAddressLookup {
     /// This starts a [`Discoverer`] that broadcasts your addresses (if advertise is set to true)
     /// and receives addresses from other endpoints in your local network.
     ///
-    /// # Errors
-    /// Returns an error if the network does not allow ipv4 OR ipv6.
-    ///
     /// # Panics
     /// This relies on [`tokio::runtime::Handle::current`] and will panic if called outside of the context of a tokio runtime.
     fn new(
@@ -246,6 +254,7 @@ impl MdnsAddressLookup {
         advertise: bool,
         service_name: String,
         filter: AddrFilter,
+        resolve_duration: Duration,
     ) -> Result<Self, AddressLookupBuilderError> {
         let err = |e| AddressLookupBuilderError::from_err(NAME, e);
         let daemon = ServiceDaemon::new().map_err(err)?;
@@ -267,11 +276,11 @@ impl MdnsAddressLookup {
         let local_addrs: Watchable<Option<EndpointData>> = Watchable::default();
         let mut addrs_change = local_addrs.watch();
         let task_sender = send.clone();
-        let my_instance = instance_name(&endpoint_id);
 
         let address_lookup_fut = async move {
+            let _bridge_ref = AbortOnDropHandle::new(bridge);
             let guard = DaemonGuard(daemon);
-            let mut endpoint_addrs: HashMap<PublicKey, AddressLookupItem> = HashMap::default();
+            let mut endpoint_addr_cache: HashMap<PublicKey, AddressLookupItem> = HashMap::default();
             let mut subscribers = Subscribers::new();
             let mut senders: HashMap<
                 PublicKey,
@@ -306,28 +315,44 @@ impl MdnsAddressLookup {
                     }
                 };
 
-                trace!(?endpoint_addrs, "Mdns Service loop tick");
-                
+                trace!(?endpoint_addr_cache, "Mdns Service loop tick");
+
                 match msg {
                     Message::Mdns(ServiceEvent::ServiceResolved(resolved_service)) => {
                         trace!(
                             ?resolved_service,
                             "Mdns Message::Mdns(ServiceEvent::ServiceResolved)"
                         );
-                        let Some(discovered_eid) = parse_id(&resolved_service.fullname) else {
+                        let Some(discovered_endpoint_id) = parse_id(&resolved_service.fullname)
+                        else {
                             debug!("failed to parse EndpointId");
                             continue;
                         };
-                        if discovered_eid == endpoint_id {
+                        if discovered_endpoint_id == endpoint_id {
                             continue;
                         }
-                        let item = todo!();
-                        if !cache_discovery(&mut endpoint_addrs, item.clone()) {
-                            debug!(?endpoint_addr, "unchanged");
+
+                        let item =
+                            match resolved_to_item(&resolved_service, &discovered_endpoint_id) {
+                                Ok(item) => item,
+                                Err(error) => {
+                                    warn!(?error, "empty service entry");
+                                    continue;
+                                }
+                            };
+
+                        debug!(
+                            ?discovered_endpoint_id,
+                            ?item,
+                            "adding endpoint to Mdns address book"
+                        );
+
+                        if !cache_discovery(&mut endpoint_addr_cache, item.clone()) {
+                            debug!(?discovered_endpoint_id, "updated but unchanged");
                             continue;
                         }
-                        
-                        if let Some(senders) = senders.get(&discovered_eid) {
+
+                        if let Some(senders) = senders.get(&discovered_endpoint_id) {
                             trace!(?item, senders = senders.len(), "sending AddressLookupItem");
                             for sender in senders.values() {
                                 sender.send(Ok(item.clone())).await.ok();
@@ -345,128 +370,68 @@ impl MdnsAddressLookup {
                             endpoint_info: item.endpoint_info().clone(),
                             last_updated: item.last_updated(),
                         });
-                    },
+                    }
                     Message::Mdns(ServiceEvent::ServiceRemoved(_, removed_service)) => {
-                        trace!(removed_service, "Mdns Message::Mdns(ServiceEvent::ServiceRemoved)");
-                        if let Some(id) = parse_id(&removed_service) {
-                            endpoint_addrs.remove(&id);
-                            subscribers.send(DiscoveryEvent::Expired { endpoint_id: id });
-                        }
-                    },
-                    Message::Mdns(service_event) => {
-                        trace!(?service_event, "Mdns Message::Mdns(other)");
-                    },
-                    Message::Resolve(public_key, sender) => todo!(),
-                    Message::Timeout(public_key, _) => todo!(),
-                    Message::Subscribe(sender) =>  {
-                        trace!("Mdns Message::Subscribe");
-                        subscribers.push(sender);
-                    },
-                }
-                /*
-                match msg {
-                    Message::Discovered(discovered_endpoint_id, peer_info) => {
                         trace!(
-                            ?discovered_endpoint_id,
-                            ?peer_info,
-                            "Mdns Message::Discovered"
+                            removed_service,
+                            "Mdns Message::Mdns(ServiceEvent::ServiceRemoved)"
                         );
-                        let discovered_endpoint_id =
-                            match PublicKey::from_str(&discovered_endpoint_id) {
-                                Ok(endpoint_id) => endpoint_id,
-                                Err(e) => {
-                                    warn!(
-                                        discovered_endpoint_id,
-                                        "couldn't parse endpoint_id from mdns Address Lookup: {e:?}"
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        if discovered_endpoint_id == endpoint_id {
-                            continue;
-                        }
-
-                        if peer_info.is_expiry() {
-                            trace!(
-                                ?discovered_endpoint_id,
-                                "removing endpoint from Mdns address book"
-                            );
-                            endpoint_addrs.remove(&discovered_endpoint_id);
-                            subscribers.send(DiscoveryEvent::Expired {
-                                endpoint_id: discovered_endpoint_id,
-                            });
-                            continue;
-                        }
-
-                        let item = peer_to_discovery_item(&peer_info, &discovered_endpoint_id);
-                        if !cache_discovery(&mut endpoint_addrs, item.clone()) {
-                            continue;
-                        }
-                        debug!(
-                            ?discovered_endpoint_id,
-                            ?peer_info,
-                            "adding endpoint to Mdns address book"
-                        );
-                        let mut resolved = false;
-                        if let Some(senders) = senders.get(&discovered_endpoint_id) {
-                            trace!(?item, senders = senders.len(), "sending AddressLookupItem");
-                            resolved = true;
-                            for sender in senders.values() {
-                                sender.send(Ok(item.clone())).await.ok();
-                            }
-                        }
-
-                        // only send endpoints to the `subscriber` if they weren't explicitly resolved
-                        // in other words, endpoints sent to the `subscribers` should only be the ones that
-                        // have been "passively" discovered
-                        if !resolved {
-                            subscribers.send(DiscoveryEvent::Discovered {
-                                endpoint_info: item.endpoint_info().clone(),
-                                last_updated: item.last_updated(),
-                            });
+                        if let Some(removed_endpoint_id) = parse_id(&removed_service) {
+                            endpoint_addr_cache.remove(&removed_endpoint_id);
+                            subscribers.send(DiscoveryEvent::Expired { endpoint_id: removed_endpoint_id });
                         }
                     }
-                    Message::Resolve(endpoint_id, sender) => {
+                    Message::Mdns(service_event) => {
+                        trace!(?service_event, "Mdns Message::Mdns(other)");
+                    }
+                    Message::Resolve(resolved_endpoint_id, sender) => {
+                        trace!(?resolved_endpoint_id, "Mdns Message::Resolve");
+
                         let id = last_id + 1;
                         last_id = id;
-                        trace!(?endpoint_id, "Mdns Message::SendAddrs");
-                        if let Some(item) = endpoint_addrs.get(&endpoint_id) {
+
+                        // if we have it in cache send it right away
+                        if let Some(item) = endpoint_addr_cache.get(&resolved_endpoint_id) {
                             debug!(?item, "sending AddressLookupItem");
                             sender.send(Ok(item.clone())).await.ok();
                         }
-                        if let Some(senders_for_endpoint_id) = senders.get_mut(&endpoint_id) {
+
+                        // register for any new mdns resolved events to be passed along
+                        if let Some(senders_for_endpoint_id) =
+                            senders.get_mut(&resolved_endpoint_id)
+                        {
                             senders_for_endpoint_id.insert(id, sender);
                         } else {
                             let mut senders_for_endpoint_id = HashMap::new();
                             senders_for_endpoint_id.insert(id, sender);
-                            senders.insert(endpoint_id, senders_for_endpoint_id);
+                            senders.insert(resolved_endpoint_id, senders_for_endpoint_id);
                         }
                         let timeout_sender = task_sender.clone();
                         timeouts.spawn(async move {
-                            time::sleep(lookup_duration).await;
-                            trace!(?endpoint_id, "resolution timeout");
+                            time::sleep(resolve_duration).await;
+                            trace!(?resolved_endpoint_id, "resolution timeout");
                             timeout_sender
-                                .send(Message::Timeout(endpoint_id, id))
+                                .send(Message::Timeout(resolved_endpoint_id, id))
                                 .await
                                 .ok();
                         });
                     }
-                    Message::Timeout(endpoint_id, id) => {
-                        trace!(?endpoint_id, "Mdns Message::Timeout");
-                        if let Some(senders_for_endpoint_id) = senders.get_mut(&endpoint_id) {
+                    Message::Timeout(timedout_endpoint_id, id) => {
+                        trace!(?timedout_endpoint_id, "Mdns Message::Timeout");
+                        if let Some(senders_for_endpoint_id) =
+                            senders.get_mut(&timedout_endpoint_id)
+                        {
                             senders_for_endpoint_id.remove(&id);
                             if senders_for_endpoint_id.is_empty() {
-                                senders.remove(&endpoint_id);
+                                senders.remove(&timedout_endpoint_id);
                             }
                         }
                     }
-                    Message::Subscribe(subscriber) => {
+                    Message::Subscribe(sender) => {
                         trace!("Mdns Message::Subscribe");
-                        subscribers.push(subscriber);
+                        subscribers.push(sender);
                     }
                 }
-                 */
             }
         };
 
@@ -489,67 +454,6 @@ impl MdnsAddressLookup {
             .ok();
         tokio_stream::wrappers::ReceiverStream::new(recv)
     }
-
-    fn spawn_discoverer(
-        endpoint_id: PublicKey,
-        advertise: bool,
-        sender: mpsc::Sender<Message>,
-        socketaddrs: BTreeSet<SocketAddr>,
-        service_name: String,
-        rt: &tokio::runtime::Handle,
-    ) -> Result<DaemonGuard, AddressLookupBuilderError> {
-        /*let spawn_rt = rt.clone();
-        let callback = move |endpoint_id: &str, peer: &Peer| {
-            trace!(endpoint_id, ?peer, "Received peer information from Mdns");
-
-            let sender = sender.clone();
-            let endpoint_id = endpoint_id.to_string();
-            let peer = peer.clone();
-            spawn_rt.spawn(async move {
-                sender
-                    .send(Message::Discovered(endpoint_id, peer))
-                    .await
-                    .ok();
-            });
-        };
-        let endpoint_id_str = data_encoding::BASE32_NOPAD
-            .encode(endpoint_id.as_bytes())
-            .to_ascii_lowercase();
-        let mut discoverer = Discoverer::new_interactive(service_name, endpoint_id_str)
-            .with_cadence(cadence)
-            .with_callback(callback)
-            .with_ip_class(IpClass::Auto);
-        if advertise {
-            let addrs = MdnsAddressLookup::socketaddrs_to_addrs(socketaddrs.iter());
-            for addr in addrs {
-                discoverer = discoverer.with_addrs(addr.0, addr.1);
-            }
-        }
-        discoverer
-            .spawn(rt)
-            .map_err(|e| AddressLookupBuilderError::from_err("mdns", e))
-            */
-        todo!("")
-    }
-
-    fn socketaddrs_to_addrs<'a>(
-        socketaddrs: impl Iterator<Item = &'a SocketAddr>,
-    ) -> HashMap<u16, Vec<IpAddr>> {
-        let mut addrs: HashMap<u16, Vec<IpAddr>> = HashMap::default();
-        for socketaddr in socketaddrs {
-            addrs
-                .entry(socketaddr.port())
-                .and_modify(|a| a.push(socketaddr.ip()))
-                .or_insert(vec![socketaddr.ip()]);
-        }
-        addrs
-    }
-}
-
-fn instance_name(id: &EndpointId) -> String {
-    data_encoding::BASE32_NOPAD
-        .encode(id.as_bytes())
-        .to_ascii_lowercase()
 }
 
 /// Caches the latest discovery item for an endpoint.
@@ -569,59 +473,41 @@ fn cache_discovery(
     changed
 }
 
-struct RecordData {
-    first_addr: Option<SocketAddr>,
-    rest_addrs: Vec<SocketAddr>,
-    relays: Vec<String>,
-    user_data: Option<UserData>,
-}
-
-impl TryFrom<&EndpointData> for RecordData {
-    type Error = String;
-
-    /// Returns [`RecordData`] for a given [`EndpointData`].
-    ///
-    /// If there are neither [`TransportAddr::Ip(SocketAddr)`] nor [`TransportAddr::Relay(RelayUrl)`] addresses we return `None` since we can't be connected to anyways.
-    ///
-    /// Note: if there are no [`TransportAddr::Ip(SocketAddr)`] but do have [`TransportAddr::Relay(RelayUrl)`] addresses
-    /// we create a [`ServiceInfo`] with no A/AAAA records and only TXT for relay and optional user data. (this needs to be tested)
-    fn try_from(data: &EndpointData) -> Result<Self, Self::Error> {
-        let mut addrs = data.ip_addrs();
-        let first_addr = addrs.next().cloned();
-        let rest_addrs = addrs.cloned().collect::<Vec<SocketAddr>>();
-
-        // Relay urls are encoded in kv as `r0` to `r99`; we don't pad the zeros to not transmit more bytes then we need
-        // but we also don't allow relay urls to be longer then 252 bytes even tough it is technially possible
-        // to have the first 10 entries (`r0=` to `r9=`) be 253 bytes long but this has no real advandate and could lead
-        // to rejection of a relay url or not based on the order they appear in the [`EndpointData`]
-        let relays = data
-            .relay_urls()
-            .map(|url| url.as_str().to_string())
-            .filter(|url| url.len() < 253)
-            .collect::<Vec<_>>();
-
-        if first_addr.is_none() && relays.is_empty() {
-            return Err("no valid addresses to publish".into());
-        }
-
-        // this needs no sice check since [`iroh_dns::endpoint_info::UserData`] already enforces a max size of 255 bytes
-        // as long as the KV entry key is `user-data`.
-        let user_data = data.user_data().cloned();
-
-        Ok(Self {
-            first_addr,
-            rest_addrs,
-            relays,
-            user_data,
-        })
-    }
-}
-
+/// Takes [`EndpointData`] and creates [`ServiceInfo`] that can be published with `mdns-sd`.
 fn build_service_info(
     endpoint_id: &EndpointId,
     data: &EndpointData,
 ) -> Result<ServiceInfo, mdns_sd::Error> {
-    let record_data: RecordData = data.try_into().map_err(mdns_sd::Error::Msg)?;
+    // If there are neither [`TransportAddr::Ip(SocketAddr)`] nor [`TransportAddr::Relay(RelayUrl)`] addresses we return
+    // a `mdns_sd::Error` since we can't be connected to anyways and therefore not build a [`ServiceInfo`].
+    //
+    // Note: if we don't have any [`TransportAddr::Ip(SocketAddr)`] but we do have [`TransportAddr::Relay(RelayUrl)`] addresses
+    // we create a [`ServiceInfo`] with no A/AAAA records and only TXT for relay and optional user data and set the port to 0
+    // (see comment in this fn below, above: "let (ip, port) = if..."). [!] todo: this still needs to be tested
+    let mut addrs = data.ip_addrs();
+    let first_addr = addrs.next().cloned();
+    let rest_addrs = addrs.cloned().collect::<Vec<SocketAddr>>();
+
+    // Relay urls are encoded in kv as `r0` to `r99`; we don't pad the zeros to not transmit more bytes then we need
+    // but we also don't allow relay urls to be longer then 252 bytes even tough it is technially possible
+    // to have the first 10 entries (`r0=` to `r9=`) be 253 bytes long but this has no real advandate and could lead
+    // to rejection of a relay url or not based on the order they appear in the [`EndpointData`]
+    let relays = data
+        .relay_urls()
+        .map(|url| url.as_str().to_string())
+        .filter(|url| url.len() < 253)
+        .collect::<Vec<_>>();
+
+    // this needs no sice check since [`iroh_dns::endpoint_info::UserData`] already enforces a max size of 255 bytes
+    // as long as the KV entry key is `user-data`.
+    let user_data = data.user_data().cloned();
+
+    // probably possible to just gate on `first_addr.is_empty()` and `relays.is_empty()` but this way if a lib user
+    // provides their own custom non iroh native discovery information they can do whatever they do with it
+    // and e.g. decrypt their custom `user_data` ip's and add them manually. Who knows :shrug:
+    if first_addr.is_none() && relays.is_empty() && user_data.is_none() {
+        return Err(mdns_sd::Error::Msg("no valid addresses to publish".into()));
+    }
 
     // If we don't have any [`TransportAddr::Ip(SocketAddr)`] to advertise and only [`TransportAddr::Relay(RelayUrl)`]
     // we have to still supply a port to [`ServiceInfo::new`]. In that case we pass 0u16 as the port, this should be allowed according to:
@@ -632,13 +518,13 @@ fn build_service_info(
     // using it to indicate service unavailability (see for example https://docs.oracle.com/cd/E88353_01/html/E72487/dns-sd-8.html).
     // Here it says "Registering a service on port 0 allows an application to explicitly advertise the non-availability of a service."
     // which is kind of correct since the service *is* not available at that instance in time. So i am using it here :shrug:
-    let (ip, port) = if let Some(addr) = record_data.first_addr {
+    let (ip, port) = if let Some(addr) = first_addr {
         (vec![addr.ip()], addr.port())
     } else {
         (Vec::new(), 0)
     };
 
-    let mut props = if let Some(user_data) = record_data.user_data {
+    let mut props = if let Some(user_data) = user_data {
         vec![(USER_DATA_KEY.to_string(), user_data.to_string())]
     } else {
         Vec::new()
@@ -646,35 +532,104 @@ fn build_service_info(
 
     // add rest of socket addrs
     props.extend(
-        record_data
-            .rest_addrs
+        rest_addrs
             .iter()
             .enumerate()
             .map(|(i, addr)| (format!("a{i}"), addr.to_string())),
     );
 
     // add relays
+    // Note: i know `iroh` only holds a single active relay except when actively dialing a peer whos
+    // home relay is different to the home relay of our node, and in local scenarios like mdns it is even
+    // less likely but i don't really see a reason not to include all realys besides larger mdns records.
+    // But this lib is intended as a replacement for `iroh-mdns-peer-lookup` and not for `iroh-mdns-address-lookup`
+    // and since the trade off between them is faster connection speeds + meant for fast cli apps vs.
+    // larger scaling + longer running clusters respectively i think including as many relays for best effort
+    // dialing is more inline with the niche this lib is intending to fill/replace.
+    // This could be wrong, i haven't looked at the underlying `iroh`/`noq` code but the downside is minimal so what ever ^^.
     props.extend(
-        record_data
-            .relays
+        relays
             .iter()
             .enumerate()
             .map(|(i, relay)| (format!("r{i}"), relay.clone())),
     );
 
-    let instance = data_encoding::BASE32_NOPAD
-        .encode(endpoint_id.as_bytes())
-        .to_ascii_lowercase();
+    let instance = instance_name(endpoint_id);
     let host = format!("{instance}.local.");
 
-    Ok(ServiceInfo::new(
+    ServiceInfo::new(
         SERVICE_TYPE,
         &instance,
         &host,
         ip.as_slice(),
         port,
         props.as_slice(),
-    )?)
+    )
+}
+
+/// Takes [`ResolvedService`] and creates [`AddressLookupItem`] that is used for `iroh` peer discovery.
+/// Returns an `Error` if no discovery information could be found.
+fn resolved_to_item(
+    info: &ResolvedService,
+    eid: &EndpointId,
+) -> Result<AddressLookupItem, &'static str> {
+    let ip_addrs: BTreeSet<SocketAddr> = info
+        .addresses
+        .iter()
+        .map(|scoped_ip| SocketAddr::new(scoped_ip.to_ip_addr(), info.get_port()))
+        .chain(info.get_properties().iter().filter_map(|prop| {
+            if prop.key().starts_with("a") {
+                prop.val_str().parse().ok()
+            } else {
+                None
+            }
+        }))
+        .collect();
+
+    let relays: BTreeSet<RelayUrl> = info
+        .get_properties()
+        .iter()
+        .filter_map(|prop| {
+            // as defined above we cap at 100 records ("r0" to "r99")
+            // see comment in fn [`build_service_info`] for reason
+            if prop.key().starts_with("r") && prop.key().len() <= 3 {
+                prop.val_str().parse().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let user_data = if let Some(user_data) = info.get_property_val_str(USER_DATA_KEY) {
+        match user_data.parse() {
+            Err(err) => {
+                debug!("failed to parse user data from TXT attribute: {err}");
+                None
+            }
+            Ok(data) => Some(data),
+        }
+    } else {
+        None
+    };
+
+    if ip_addrs.is_empty() && relays.is_empty() && user_data.is_none() {
+        return Err("no discovery information provided");
+    }
+
+    let mut data = EndpointData::from(ip_addrs);
+    for relay in relays {
+        data.add_relay_url(relay);
+    }
+    data.set_user_data(user_data);
+
+    let endpoint_info = EndpointInfo::from_parts(*eid, data);
+    Ok(AddressLookupItem::new(endpoint_info, NAME, None))
+}
+
+fn instance_name(id: &EndpointId) -> String {
+    data_encoding::BASE32_NOPAD
+        .encode(id.as_bytes())
+        .to_ascii_lowercase()
 }
 
 fn parse_id(fullname: &str) -> Option<PublicKey> {
