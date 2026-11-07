@@ -190,7 +190,7 @@ impl AddressLookup for MdnsAddressLookup {
         endpoint_id: EndpointId,
     ) -> Option<BoxStream<Result<AddressLookupItem, AddressLookupError>>> {
         use futures_util::FutureExt;
-
+        trace!(?endpoint_id, "AddressLookup resolve request");
         let (send, recv) = mpsc::channel(20);
         let address_lookup_sender = self.sender.clone();
         let stream = async move {
@@ -203,9 +203,10 @@ impl AddressLookup for MdnsAddressLookup {
         Some(Box::pin(stream.flatten_stream()))
     }
 
-    fn publish(&self, data: &EndpointData) {
+    fn publish(&self, endpoint_data: &EndpointData) {
         if self.advertise {
-            self.local_addrs.set(Some(data.clone())).ok();
+            trace!(?endpoint_data, "AddressLookup publish request");
+            self.local_addrs.set(Some(endpoint_data.clone())).ok();
         }
     }
 }
@@ -252,13 +253,13 @@ impl MdnsAddressLookup {
     fn new(
         endpoint_id: EndpointId,
         advertise: bool,
-        service_name: String,
+        service_type: String,
         filter: AddrFilter,
         resolve_duration: Duration,
     ) -> Result<Self, AddressLookupBuilderError> {
         let err = |e| AddressLookupBuilderError::from_err(NAME, e);
         let daemon = ServiceDaemon::new().map_err(err)?;
-        let browse_rx = daemon.browse(&service_name).map_err(err)?;
+        let browse_rx = daemon.browse(&service_type).map_err(err)?;
 
         let (send, mut recv) = mpsc::channel(64);
 
@@ -267,11 +268,22 @@ impl MdnsAddressLookup {
         let bridge = task::spawn(async move {
             while let Ok(ev) = browse_rx.recv_async().await {
                 if let Err(e) = bridge_tx.send(Message::Mdns(ev)).await {
-                    warn!(?e, "mdns-sd bridge channel closed, stopping mdns-sd bridge");
+                    warn!(?e, "bridge channel closed, stopping mdns-sd bridge");
                     break;
                 }
             }
         });
+
+        #[cfg(debug_assertions)]
+        {
+            tracing::debug!("Starting mdns-sd Daemon monitor (debug mode)...");
+            let monitor_rx = daemon.monitor().map_err(err)?;
+            std::thread::spawn(move || {
+                while let Ok(event) = monitor_rx.recv() {
+                    tracing::debug!(?event, "monitor");
+                }
+            });
+        }
 
         let local_addrs: Watchable<Option<EndpointData>> = Watchable::default();
         let mut addrs_change = local_addrs.watch();
@@ -304,10 +316,15 @@ impl MdnsAddressLookup {
                         },
                     },
                     Ok(Some(data)) = addrs_change.updated() => {
+                        trace!(?data, "address info updated");
                         let data = data.apply_filter(&filter).into_owned();
-                        match build_service_info(&endpoint_id, &data) {
-                            Ok(info) => if let Err(e) = guard.0.register(info) {
-                                warn!(?e, "mdns-sd register failed");
+                        match build_service_info(&service_type, &endpoint_id, &data) {
+                            Ok(info) => {
+                                if let Err(e) = guard.0.register(info.clone()) {
+                                    warn!(?e, "register failed");
+                                } else {
+                                    debug!(?info, "registered");
+                                }
                             }
                             Err(e) => warn!(?e, "bad service info"),
                         }
@@ -323,7 +340,8 @@ impl MdnsAddressLookup {
                             ?resolved_service,
                             "Mdns Message::Mdns(ServiceEvent::ServiceResolved)"
                         );
-                        let Some(discovered_endpoint_id) = parse_id(&resolved_service.fullname)
+                        let Some(discovered_endpoint_id) =
+                            parse_id(&service_type, &resolved_service.fullname)
                         else {
                             debug!("failed to parse EndpointId");
                             continue;
@@ -376,9 +394,12 @@ impl MdnsAddressLookup {
                             removed_service,
                             "Mdns Message::Mdns(ServiceEvent::ServiceRemoved)"
                         );
-                        if let Some(removed_endpoint_id) = parse_id(&removed_service) {
+                        if let Some(removed_endpoint_id) = parse_id(&service_type, &removed_service)
+                        {
                             endpoint_addr_cache.remove(&removed_endpoint_id);
-                            subscribers.send(DiscoveryEvent::Expired { endpoint_id: removed_endpoint_id });
+                            subscribers.send(DiscoveryEvent::Expired {
+                                endpoint_id: removed_endpoint_id,
+                            });
                         }
                     }
                     Message::Mdns(service_event) => {
@@ -475,6 +496,7 @@ fn cache_discovery(
 
 /// Takes [`EndpointData`] and creates [`ServiceInfo`] that can be published with `mdns-sd`.
 fn build_service_info(
+    service_type: &str,
     endpoint_id: &EndpointId,
     data: &EndpointData,
 ) -> Result<ServiceInfo, mdns_sd::Error> {
@@ -484,9 +506,7 @@ fn build_service_info(
     // Note: if we don't have any [`TransportAddr::Ip(SocketAddr)`] but we do have [`TransportAddr::Relay(RelayUrl)`] addresses
     // we create a [`ServiceInfo`] with no A/AAAA records and only TXT for relay and optional user data and set the port to 0
     // (see comment in this fn below, above: "let (ip, port) = if..."). [!] todo: this still needs to be tested
-    let mut addrs = data.ip_addrs();
-    let first_addr = addrs.next().cloned();
-    let rest_addrs = addrs.cloned().collect::<Vec<SocketAddr>>();
+    let addrs = data.ip_addrs().cloned().collect::<Vec<SocketAddr>>();
 
     // Relay urls are encoded in kv as `r0` to `r99`; we don't pad the zeros to not transmit more bytes then we need
     // but we also don't allow relay urls to be longer then 252 bytes even tough it is technially possible
@@ -505,7 +525,7 @@ fn build_service_info(
     // probably possible to just gate on `first_addr.is_empty()` and `relays.is_empty()` but this way if a lib user
     // provides their own custom non iroh native discovery information they can do whatever they do with it
     // and e.g. decrypt their custom `user_data` ip's and add them manually. Who knows :shrug:
-    if first_addr.is_none() && relays.is_empty() && user_data.is_none() {
+    if addrs.is_empty() && relays.is_empty() && user_data.is_none() {
         return Err(mdns_sd::Error::Msg("no valid addresses to publish".into()));
     }
 
@@ -518,11 +538,7 @@ fn build_service_info(
     // using it to indicate service unavailability (see for example https://docs.oracle.com/cd/E88353_01/html/E72487/dns-sd-8.html).
     // Here it says "Registering a service on port 0 allows an application to explicitly advertise the non-availability of a service."
     // which is kind of correct since the service *is* not available at that instance in time. So i am using it here :shrug:
-    let (ip, port) = if let Some(addr) = first_addr {
-        (vec![addr.ip()], addr.port())
-    } else {
-        (Vec::new(), 0)
-    };
+    let port = addrs.first().map(|addr| addr.port()).unwrap_or_default();
 
     let mut props = if let Some(user_data) = user_data {
         vec![(USER_DATA_KEY.to_string(), user_data.to_string())]
@@ -532,7 +548,7 @@ fn build_service_info(
 
     // add rest of socket addrs
     props.extend(
-        rest_addrs
+        addrs
             .iter()
             .enumerate()
             .map(|(i, addr)| (format!("a{i}"), addr.to_string())),
@@ -557,13 +573,9 @@ fn build_service_info(
     let instance = instance_name(endpoint_id);
     let host = format!("{instance}.local.");
 
-    ServiceInfo::new(
-        SERVICE_TYPE,
-        &instance,
-        &host,
-        ip.as_slice(),
-        port,
-        props.as_slice(),
+    Ok(
+        ServiceInfo::new(service_type, &instance, &host, "", port, props.as_slice())?
+            .enable_addr_auto(),
     )
 }
 
@@ -632,7 +644,7 @@ fn instance_name(id: &EndpointId) -> String {
         .to_ascii_lowercase()
 }
 
-fn parse_id(fullname: &str) -> Option<PublicKey> {
-    let inst = fullname.strip_suffix(SERVICE_TYPE)?.strip_suffix('.')?;
+fn parse_id(service_type: &str, fullname: &str) -> Option<PublicKey> {
+    let inst = fullname.strip_suffix(service_type)?.strip_suffix('.')?;
     PublicKey::from_str(inst).ok()
 }
