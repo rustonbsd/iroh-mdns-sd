@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     });
 
     let mut set = JoinSet::new();
-    let endpoint_count = 1;
+    let endpoint_count = 5;
     for _ in 0..endpoint_count {
         let ud = user_data.clone();
         set.spawn(async move {
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
             ep.address_lookup()?
                 .add(MdnsAddressLookup::builder().build(ep.id())?);
             ep.set_user_data_for_address_lookup(Some(ud));
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
             ep.close().await;
             n0_error::Ok(())
         });
