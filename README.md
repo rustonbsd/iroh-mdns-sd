@@ -1,5 +1,5 @@
 # iroh-mdns-sd
-[![Crates.io](https://img.shields.io/crates/v/iroh-mdns-sd.svg)](https://crates.io/crates/iroh-ssh)
+[![Crates.io](https://img.shields.io/crates/v/iroh-mdns-sd.svg)](https://crates.io/crates/iroh-mdns-sd)
 [![Documentation](https://docs.rs/iroh-mdns-sd/badge.svg)](https://docs.rs/iroh-mdns-sd)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/discord/1403836127458099381?logo=discord&label=Discord)](https://discord.gg/c22SPMYAwZ)
