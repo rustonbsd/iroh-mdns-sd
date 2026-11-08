@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeSet, HashMap},
-    net::SocketAddr,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -55,6 +55,17 @@ enum Message {
     ),
     Timeout(EndpointId, usize),
     Subscribe(mpsc::Sender<DiscoveryEvent>),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PublishGroup {
+    ips: BTreeSet<IpAddr>,
+    txt: Vec<(String, String)>,
+}
+
+struct RegistrationUpdate {
+    register: Vec<ServiceInfo>,
+    unregister: Vec<String>,
 }
 
 /// Manages the list of subscribers that are subscribed to this Address Lookup.
@@ -298,6 +309,7 @@ impl MdnsAddressLookup {
                 PublicKey,
                 HashMap<usize, mpsc::Sender<Result<AddressLookupItem, AddressLookupError>>>,
             > = HashMap::default();
+            let mut published: BTreeMap<u16, PublishGroup> = BTreeMap::new();
             let mut last_id: usize = 0usize;
             let mut timeouts = JoinSet::new();
             loop {
@@ -318,18 +330,41 @@ impl MdnsAddressLookup {
                     Ok(Some(data)) = addrs_change.updated() => {
                         trace!(?data, "address info updated");
                         let data = data.apply_filter(&filter).into_owned();
-                        match build_service_info(&service_type, &endpoint_id, &data) {
-                            Ok(info) => {
-                                if let Err(e) = guard.0.register(info.clone()) {
-                                    warn!(?e, "register failed");
-                                } else {
-                                    debug!(?info, "registered");
+                        // untested
+                        match sync_registrations(&service_type, &endpoint_id, &data, &mut published) {
+                            Some(updates) => {
+                                for svc in updates.register {
+                                    if let Err(e) = guard.0.register(svc.clone()) {
+                                        warn!(?e, "register failed");
+                                    } else {
+                                        debug!(?svc, "registered");
+                                    }
+                                }
+                                for fullname in updates.unregister {
+                                    if let Err(e) = guard.0.unregister(&fullname) {
+                                        warn!(?e, "unregister failed");
+                                    } else {
+                                        debug!(fullname, "unregistered");
+                                    }
                                 }
                             }
-                            Err(e) => warn!(?e, "bad service info"),
+                            None => debug!("no update needed even tough address change.updated() was called"),
                         }
                         continue;
                     }
+                    /*
+                    Ok(Some(data)) = addrs_change.updated() => {
+                        trace!(?data, "address info updated");
+                        let data = data.apply_filter(&filter).into_owned();
+                        sync_registrations(
+                            &guard.0,
+                            &service_type,
+                            &endpoint_id,
+                            &data,
+                            &mut published,
+                        );
+                        continue;
+                    } */
                 };
 
                 trace!(?endpoint_addr_cache, "Mdns Service loop tick");
@@ -494,68 +529,20 @@ fn cache_discovery(
     changed
 }
 
-/// Takes [`EndpointData`] and creates [`ServiceInfo`] that can be published with `mdns-sd`.
-fn build_service_info(
-    service_type: &str,
-    endpoint_id: &EndpointId,
-    data: &EndpointData,
-) -> Result<ServiceInfo, mdns_sd::Error> {
-    // If there are neither [`TransportAddr::Ip(SocketAddr)`] nor [`TransportAddr::Relay(RelayUrl)`] addresses we return
-    // a `mdns_sd::Error` since we can't be connected to anyways and therefore not build a [`ServiceInfo`].
-    //
-    // Note: if we don't have any [`TransportAddr::Ip(SocketAddr)`] but we do have [`TransportAddr::Relay(RelayUrl)`] addresses
-    // we create a [`ServiceInfo`] with no A/AAAA records and only TXT for relay and optional user data and set the port to 0
-    // (see comment in this fn below, above: "let (ip, port) = if..."). [!] todo: this still needs to be tested
-    let addrs = data.ip_addrs().cloned().collect::<Vec<SocketAddr>>();
-
-    // Relay urls are encoded in kv as `r0` to `r99`; we don't pad the zeros to not transmit more bytes then we need
-    // but we also don't allow relay urls to be longer then 252 bytes even tough it is technially possible
-    // to have the first 10 entries (`r0=` to `r9=`) be 253 bytes long but this has no real advandate and could lead
-    // to rejection of a relay url or not based on the order they appear in the [`EndpointData`]
-    let relays = data
-        .relay_urls()
-        .map(|url| url.as_str().to_string())
-        .filter(|url| url.len() < 253)
-        .collect::<Vec<_>>();
-
-    // this needs no sice check since [`iroh_dns::endpoint_info::UserData`] already enforces a max size of 255 bytes
-    // as long as the KV entry key is `user-data`.
-    let user_data = data.user_data().cloned();
-
-    // probably possible to just gate on `first_addr.is_empty()` and `relays.is_empty()` but this way if a lib user
-    // provides their own custom non iroh native discovery information they can do whatever they do with it
-    // and e.g. decrypt their custom `user_data` ip's and add them manually. Who knows :shrug:
-    if addrs.is_empty() && relays.is_empty() && user_data.is_none() {
-        return Err(mdns_sd::Error::Msg("no valid addresses to publish".into()));
-    }
-
-    // If we don't have any [`TransportAddr::Ip(SocketAddr)`] to advertise and only [`TransportAddr::Relay(RelayUrl)`]
-    // we have to still supply a port to [`ServiceInfo::new`]. In that case we pass 0u16 as the port, this should be allowed according to:
-    // [rfc6763 section 8](https://www.rfc-editor.org/rfc/rfc6763.html#section-8)
-    // "[..] creates a placeholder SRV record (priority=0, weight=0, port=0, target host = host name of device) [..]".
-    //
-    // This is technically ment for announcing we are not supporting the service but i also found other protocols and implementations
-    // using it to indicate service unavailability (see for example https://docs.oracle.com/cd/E88353_01/html/E72487/dns-sd-8.html).
-    // Here it says "Registering a service on port 0 allows an application to explicitly advertise the non-availability of a service."
-    // which is kind of correct since the service *is* not available at that instance in time. So i am using it here :shrug:
-    let port = addrs.first().map(|addr| addr.port()).unwrap_or_default();
-
-    let mut props = if let Some(user_data) = user_data {
+// untested
+fn build_groups(data: &EndpointData) -> BTreeMap<u16, PublishGroup> {
+    let mut txt = if let Some(user_data) = data.user_data() {
         vec![(USER_DATA_KEY.to_string(), user_data.to_string())]
     } else {
         Vec::new()
     };
 
-    // add rest of socket addrs
-    props.extend(
-        addrs
-            .iter()
-            .enumerate()
-            .map(|(i, addr)| (format!("a{i}"), addr.to_string())),
-    );
-
-    // add relays
-    // Note: i know `iroh` only holds a single active relay except when actively dialing a peer whos
+    // Relay urls are encoded in kv as `r0` to `r99`; we don't pad the zeros to not transmit more bytes then we need
+    // but we also don't allow relay urls to be longer then 252 bytes even tough it is technially possible
+    // to have the first 10 entries (`r0=` to `r9=`) be 253 bytes long but this has no real advandate and could lead
+    // to rejection of a relay url or not based on the order they appear in the [`EndpointData`]
+    //
+    // Note: i know `iroh` mostly holds a single active relay except when actively dialing a peer whos
     // home relay is different to the home relay of our node, and in local scenarios like mdns it is even
     // less likely but i don't really see a reason not to include all realys besides larger mdns records.
     // But this lib is intended as a replacement for `iroh-mdns-peer-lookup` and not for `iroh-mdns-address-lookup`
@@ -563,20 +550,103 @@ fn build_service_info(
     // larger scaling + longer running clusters respectively i think including as many relays for best effort
     // dialing is more inline with the niche this lib is intending to fill/replace.
     // This could be wrong, i haven't looked at the underlying `iroh`/`noq` code but the downside is minimal so what ever ^^.
-    props.extend(
-        relays
-            .iter()
+    txt.extend(
+        data.relay_urls()
+            .map(|url| url.as_str().to_string())
+            .filter(|url| url.len() < 253)
             .enumerate()
             .map(|(i, relay)| (format!("r{i}"), relay.clone())),
     );
 
-    let instance = instance_name(endpoint_id);
-    let host = format!("{instance}.local.");
+    let mut srv_map: BTreeMap<u16, PublishGroup> = BTreeMap::new();
+    for addr in data.ip_addrs() {
+        srv_map
+            .entry(addr.port())
+            .or_insert(PublishGroup {
+                ips: BTreeSet::new(),
+                txt: txt.clone(),
+            })
+            .ips
+            .insert(addr.ip());
+    }
 
-    Ok(
-        ServiceInfo::new(service_type, &instance, &host, "", port, props.as_slice())?
-            .enable_addr_auto(),
-    )
+    // Probably possible to just gate on `no addresses` and `no relays` but this way if a user
+    // provides their own custom non iroh native discovery information they can do whatever they do with it
+    // and e.g. decrypt their custom `user_data` ip's and add them manually. Who knows :shrug:
+    if srv_map.is_empty() {
+        // Note: if we don't have any [`TransportAddr::Ip(SocketAddr)`] but we do have [`TransportAddr::Relay(RelayUrl)`] addresses
+        // we create a [`ServiceInfo`] with no A/AAAA records and only TXT for relay and optional user data and set the port to 0.
+        // Since in this case we still have to supply a port to [`ServiceInfo::new`] we pass 0u16 as the port, this should be allowed according to:
+        // [rfc6763 section 8](https://www.rfc-editor.org/rfc/rfc6763.html#section-8)
+        // "[..] creates a placeholder SRV record (priority=0, weight=0, port=0, target host = host name of device) [..]".
+        //
+        // This is technically ment for announcing we are not supporting the service but i also found other protocols and implementations
+        // using it to indicate service unavailability (see for example https://docs.oracle.com/cd/E88353_01/html/E72487/dns-sd-8.html).
+        // Here it says "Registering a service on port 0 allows an application to explicitly advertise the non-availability of a service."
+        // which is kind of correct since the service *is* not available at that instance in time. So i am using it here :shrug:
+        if !txt.is_empty() {
+            srv_map.insert(
+                0,
+                PublishGroup {
+                    ips: BTreeSet::new(),
+                    txt,
+                },
+            );
+        }
+    }
+    srv_map
+}
+
+/// todo: this is not the right comment below
+///  Takes [`EndpointData`] and creates [`ServiceInfo`] that can be published with `mdns-sd`.
+// untested
+fn sync_registrations(
+    service_type: &str,
+    endpoint_id: &EndpointId,
+    data: &EndpointData,
+    published: &mut BTreeMap<u16, PublishGroup>,
+) -> Option<RegistrationUpdate> {
+    let desired_state = build_groups(data);
+    let mut register = Vec::new();
+    let mut unregister = Vec::new();
+    for (port, group) in &desired_state {
+        if published.get(port) != Some(group) {
+            let instance = instance_label(endpoint_id, *port);
+            let host = format!("{instance}.local.");
+            match ServiceInfo::new(
+                service_type,
+                &instance,
+                &host,
+                group.ips.iter().collect::<Vec<_>>().as_slice(),
+                *port,
+                group.txt.as_slice(),
+            ) {
+                Ok(svc) => {
+                    published.insert(*port, group.clone());
+                    register.push(svc);
+                }
+                Err(e) => warn!(?e, "bad service info"),
+            }
+        }
+    }
+
+    published.retain(|port, _| {
+        if desired_state.contains_key(port) {
+            return true;
+        }
+        let fullname = format!("{}.{service_type}", instance_label(endpoint_id, *port));
+        unregister.push(fullname);
+        false
+    });
+
+    if unregister.is_empty() && register.is_empty() {
+        None
+    } else {
+        Some(RegistrationUpdate {
+            register,
+            unregister,
+        })
+    }
 }
 
 /// Takes [`ResolvedService`] and creates [`AddressLookupItem`] that is used for `iroh` peer discovery.
@@ -638,13 +708,20 @@ fn resolved_to_item(
     Ok(AddressLookupItem::new(endpoint_info, NAME, None))
 }
 
-fn instance_name(id: &EndpointId) -> String {
-    data_encoding::BASE32_NOPAD
-        .encode(id.as_bytes())
-        .to_ascii_lowercase()
+/// Address format is "<z32 EndpointId>-<port 0-65536>._irohsd._udp.local."
+fn instance_label(id: &EndpointId, port: u16) -> String {
+    format!(
+        "{}-{port}",
+        data_encoding::BASE32_NOPAD
+            .encode(id.as_bytes())
+            .to_ascii_lowercase()
+    )
 }
 
+/// Parses out [`EndpointId`] and `port` from record `fullname`
 fn parse_id(service_type: &str, fullname: &str) -> Option<PublicKey> {
     let inst = fullname.strip_suffix(service_type)?.strip_suffix('.')?;
-    PublicKey::from_str(inst).ok()
+    let (id, port) = inst.rsplit_once('-')?;
+    port.parse::<u16>().ok()?;
+    PublicKey::from_str(id).ok()
 }
